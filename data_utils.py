@@ -117,6 +117,11 @@ class TextMelCollate():
             output_lengths[i] = mel.size(1)
         
         # Emotion Intensity
+        ed_padded = torch.FloatTensor(len(batch), 12, max_input_len)
+        ed_padded.zero_()
+        for i in range(len(ids_sorted_decreasing)):
+            ed = batch[ids_sorted_decreasing[i]][2]
+            ed_padded[i, :, :ed.size(1)] = ed
 
         return text_padded, input_lengths, mel_padded, gate_padded, \
-            output_lengths
+            output_lengths, ed_padded
