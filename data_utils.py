@@ -26,15 +26,18 @@ class TextMelLoader(torch.utils.data.Dataset):
             hparams.mel_fmax)
         random.seed(hparams.seed)
         random.shuffle(self.audiopaths_and_text)
+        self.Dataset_dir = hparams.Dataset_dir
 
     def get_mel_text_pair(self, audiopath_and_text):
         # separate filename and text
         audiopath, text = audiopath_and_text[0], audiopath_and_text[1]
         text = self.get_text(text)
         mel = self.get_mel(audiopath)
-        return (text, mel)
+        ed = self.get_ed(audiopath)
+        return (text, mel, ed)
 
     def get_mel(self, filename):
+        filename = self.Dataset_dir + filename
         if not self.load_mel_from_disk:
             audio, sampling_rate = load_wav_to_torch(filename)
             if sampling_rate != self.stft.sampling_rate:
@@ -56,6 +59,12 @@ class TextMelLoader(torch.utils.data.Dataset):
     def get_text(self, text):
         text_norm = torch.IntTensor(text_to_sequence(text, self.text_cleaners))
         return text_norm
+    
+    def get_ed(self, filename):
+        filename = ".".join(filename.split(".")[:-1]) + "_ED.npy"
+        filename = self.Dataset_dir + filename
+        ed = torch.from_numpy(np.load(filename))
+        return ed
 
     def __getitem__(self, index):
         return self.get_mel_text_pair(self.audiopaths_and_text[index])
@@ -106,6 +115,8 @@ class TextMelCollate():
             mel_padded[i, :, :mel.size(1)] = mel
             gate_padded[i, mel.size(1)-1:] = 1
             output_lengths[i] = mel.size(1)
+        
+        # Emotion Intensity
 
         return text_padded, input_lengths, mel_padded, gate_padded, \
             output_lengths
