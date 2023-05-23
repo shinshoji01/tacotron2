@@ -4,8 +4,11 @@ import torch
 import torch.utils.data
 
 import layers
-from utils import load_wav_to_torch, load_filepaths_and_text
 from text import text_to_sequence
+
+import sys
+sys.path.append("/work/Git/")
+from tacotron2.utils import load_wav_to_torch, load_filepaths_and_text
 
 
 class TextMelLoader(torch.utils.data.Dataset):
@@ -27,6 +30,9 @@ class TextMelLoader(torch.utils.data.Dataset):
         random.seed(hparams.seed)
         random.shuffle(self.audiopaths_and_text)
         self.Dataset_dir = hparams.Dataset_dir
+        self.mel_mean_std = np.load(hparams.mel_mean_std)
+        self.normalize_mel = hparams.normalize_mel
+        self.blizzard_normalization = hparams.blizzard_normalization
 
     def get_mel_text_pair(self, audiopath_and_text):
         # separate filename and text
@@ -34,7 +40,8 @@ class TextMelLoader(torch.utils.data.Dataset):
         text = self.get_text(text)
         mel = self.get_mel(audiopath)
         ed = self.get_ed(audiopath)
-        return (text, mel, ed)
+        sp = self.get_sp(audiopath)
+        return (text, mel, ed, sp)
 
     def get_mel(self, filename):
         filename = self.Dataset_dir + filename
@@ -54,6 +61,8 @@ class TextMelLoader(torch.utils.data.Dataset):
                 'Mel dimension mismatch: given {}, expected {}'.format(
                     melspec.size(0), self.stft.n_mel_channels))
 
+        if self.normalize_mel:
+            melspec = (melspec-self.mel_mean_std[0])/self.mel_mean_std[1]
         return melspec
 
     def get_text(self, text):
@@ -61,7 +70,16 @@ class TextMelLoader(torch.utils.data.Dataset):
         return text_norm
     
     def get_ed(self, filename):
-        filename = ".".join(filename.split(".")[:-1]) + "_ED.npy"
+        if self.blizzard_normalization:
+            filename = ".".join(filename.split(".")[:-1]) + "_EI.npy"
+        else:
+            filename = ".".join(filename.split(".")[:-1]) + "_ED.npy"
+        filename = self.Dataset_dir + filename
+        ed = torch.from_numpy(np.load(filename))
+        return ed
+    
+    def get_sp(self, filename):
+        filename = ".".join(filename.split(".")[:-1]) + "_SP.npy"
         filename = self.Dataset_dir + filename
         ed = torch.from_numpy(np.load(filename))
         return ed
@@ -122,6 +140,13 @@ class TextMelCollate():
         for i in range(len(ids_sorted_decreasing)):
             ed = batch[ids_sorted_decreasing[i]][2]
             ed_padded[i, :, :ed.size(1)] = ed
+            
+        # Symbol Position
+        sp_padded = torch.FloatTensor(len(batch), 3, max_input_len)
+        sp_padded.zero_()
+        for i in range(len(ids_sorted_decreasing)):
+            sp = batch[ids_sorted_decreasing[i]][3]
+            sp_padded[i, :, :sp.size(1)] = sp
 
         return text_padded, input_lengths, mel_padded, gate_padded, \
-            output_lengths, ed_padded
+            output_lengths, ed_padded, sp_padded

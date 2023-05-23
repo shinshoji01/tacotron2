@@ -10,11 +10,14 @@ import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 
-from model import Tacotron2
 from data_utils import TextMelLoader, TextMelCollate
 from loss_function import Tacotron2Loss
 # from logger import Tacotron2Logger
 # from hparams import create_hparams
+
+import sys
+sys.path.append("/work/Git/")
+from tacotron2.model_copy import Tacotron2
 
 
 def reduce_tensor(tensor, n_gpus):

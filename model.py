@@ -1,10 +1,18 @@
 from math import sqrt
+import numpy as np
 import torch
 from torch.autograd import Variable
 from torch import nn
 from torch.nn import functional as F
 from layers import ConvNorm, LinearNorm
-from utils import to_gpu, get_mask_from_lengths
+
+import sys
+sys.path.append("/work/Git/")
+from tacotron2.utils import to_gpu, get_mask_from_lengths
+
+# import sys
+# sys.path.append("/work/Git/Tacotronpytorch/")
+from Tacotronpytorch.modelsh.model import Decoder_GMM
 
 
 class LocationLayer(nn.Module):
@@ -206,8 +214,8 @@ class Decoder(nn.Module):
         super(Decoder, self).__init__()
         self.n_mel_channels = hparams.n_mel_channels
         self.n_frames_per_step = hparams.n_frames_per_step
-        if hparams.include_ed:
-            self.encoder_embedding_dim = hparams.encoder_embedding_dim + 12
+        if hparams.include_ed and hparams.combination=="concatenation":
+            self.encoder_embedding_dim = hparams.encoder_embedding_dim + np.array(hparams["phones_words_utterance"]).sum()*4
         else:
             self.encoder_embedding_dim = hparams.encoder_embedding_dim
         self.attention_rnn_dim = hparams.attention_rnn_dim
@@ -470,13 +478,34 @@ class Tacotron2(nn.Module):
         val = sqrt(3.0) * std  # uniform bounds for std
         self.embedding.weight.data.uniform_(-val, val)
         self.encoder = Encoder(hparams)
-        self.decoder = Decoder(hparams)
+        if hparams.attention_type=="LST":
+            self.decoder = Decoder(hparams)
+        elif hparams.attention_type=="GMM":
+            self.decoder = Decoder_GMM(hparams.n_mel_channels,
+                                       hparams.n_frames_per_step,
+                                       hparams.encoder_embedding_dim,
+                                       [hparams.prenet_dim, hparams.prenet_dim],
+                                       0.5,
+                                       hparams.attention_dim,
+                                       hparams.attention_rnn_dim,
+                                       hparams.p_attention_dropout,
+                                       hparams.decoder_rnn_dim,
+                                       None,
+                                       hparams.p_decoder_dropout,
+                                       hparams.max_decoder_steps,
+                                       hparams.gate_threshold)
         self.postnet = Postnet(hparams)
         self.include_ed = hparams.include_ed
+        self.combination = hparams.combination
+        self.ed_bool_list = np.array(hparams["phones_words_utterance"]).repeat(4)
+        self.attention_type = hparams.attention_type
+        if hparams.include_ed and hparams.combination=="addition":
+            self.ed_embedding = LinearNorm(self.ed_bool_list.sum(), hparams.encoder_embedding_dim,
+                                           bias=False, w_init_gain='tanh')
 
     def parse_batch(self, batch):
         text_padded, input_lengths, mel_padded, gate_padded, \
-            output_lengths, ed_padded = batch
+            output_lengths, ed_padded, sp_padded = batch
         text_padded = to_gpu(text_padded).long()
         input_lengths = to_gpu(input_lengths).long()
         max_len = torch.max(input_lengths.data).item()
@@ -484,9 +513,10 @@ class Tacotron2(nn.Module):
         gate_padded = to_gpu(gate_padded).float()
         output_lengths = to_gpu(output_lengths).long()
         ed_padded = to_gpu(ed_padded).float()
+        sp_padded = to_gpu(sp_padded).float()
 
         return (
-            (text_padded, input_lengths, mel_padded, max_len, output_lengths, ed_padded),
+            (text_padded, input_lengths, mel_padded, max_len, output_lengths, ed_padded, sp_padded),
             (mel_padded, gate_padded))
 
     def parse_output(self, outputs, output_lengths=None):
@@ -502,19 +532,30 @@ class Tacotron2(nn.Module):
         return outputs
 
     def forward(self, inputs):
-        text_inputs, text_lengths, mels, max_len, output_lengths, mel_padded = inputs
+        text_inputs, text_lengths, mels, max_len, output_lengths, ed, sp = inputs
         text_lengths, output_lengths = text_lengths.data, output_lengths.data
+        ed = ed[:, self.ed_bool_list, :]
 
         embedded_inputs = self.embedding(text_inputs).transpose(1, 2)
 
         encoder_outputs = self.encoder(embedded_inputs, text_lengths)
-        print(encoder_outputs.shape)
         if self.include_ed:
-            encoder_outputs = torch.cat([encoder_outputs, mel_padded.transpose(1, 2)], axis=2)
-        print(encoder_outputs.shape)
+            if self.combination=="concatenation":
+                encoder_outputs = torch.cat([encoder_outputs, ed.transpose(1, 2)], axis=2)
+            elif self.combination=="addition":
+                encoder_outputs = encoder_outputs + self.ed_embedding(ed.transpose(1, 2))
+            else:
+                assert False, "combination should be either 'concatenation' or 'addition'"
 
-        mel_outputs, gate_outputs, alignments = self.decoder(
-            encoder_outputs, mels, memory_lengths=text_lengths)
+        if self.attention_type=="LST":
+            mel_outputs, gate_outputs, alignments = self.decoder(
+                encoder_outputs, mels, memory_lengths=text_lengths)
+        elif self.attention_type=="GMM":
+            mel_outputs, gate_outputs, alignments = self.decoder(
+                encoder_outputs, mels.transpose(1, 2), memory_lengths=text_lengths)
+            mel_outputs = mel_outputs.transpose(1, 2)
+        else:
+            assert False, "attention_type should be either 'LST' or 'GMM'"
 
         mel_outputs_postnet = self.postnet(mel_outputs)
         mel_outputs_postnet = mel_outputs + mel_outputs_postnet
@@ -524,10 +565,23 @@ class Tacotron2(nn.Module):
             output_lengths)
 
     def inference(self, inputs):
+        inputs, ed = inputs
+        ed = ed[:, self.ed_bool_list, :]
         embedded_inputs = self.embedding(inputs).transpose(1, 2)
         encoder_outputs = self.encoder.inference(embedded_inputs)
-        mel_outputs, gate_outputs, alignments = self.decoder.inference(
-            encoder_outputs)
+        if self.include_ed:
+            if self.combination=="concatenation":
+                encoder_outputs = torch.cat([encoder_outputs, ed.transpose(1, 2)], axis=2)
+            elif self.combination=="addition":
+                encoder_outputs = encoder_outputs + self.ed_embedding(ed.transpose(1, 2))
+        if self.attention_type=="LST":
+            mel_outputs, gate_outputs, alignments = self.decoder.inference(encoder_outputs)
+        elif self.attention_type=="GMM":
+            mel_outputs, gate_outputs, alignments = self.decoder(
+                encoder_outputs, None, memory_lengths=None)
+            mel_outputs = mel_outputs.transpose(1, 2)
+        else:
+            assert False, "attention_type should be either 'LST' or 'GMM'"
 
         mel_outputs_postnet = self.postnet(mel_outputs)
         mel_outputs_postnet = mel_outputs + mel_outputs_postnet
