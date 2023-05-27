@@ -10,6 +10,131 @@ import sys
 sys.path.append("/work/Git/")
 from tacotron2.utils import to_gpu, get_mask_from_lengths
 
+# import sys
+# sys.path.append("/work/Git/Tacotronpytorch/")
+from Tacotronpytorch.modelsh.model import Decoder_GMM
+
+class GMMAttention(nn.Module):
+    def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
+                 attention_location_n_filters, attention_location_kernel_size):
+        super(GMMAttention, self).__init__()
+        # self.query_layer = LinearNorm(attention_rnn_dim, attention_dim,
+        #                               bias=False, w_init_gain='tanh')
+        self.memory_layer = LinearNorm(embedding_dim, attention_dim, bias=False,
+                                       w_init_gain='tanh')
+        # self.v = LinearNorm(attention_dim, 1, bias=False)
+        # self.location_layer = LocationLayer(attention_location_n_filters,
+        #                                     attention_location_kernel_size,
+        #                                     attention_dim)
+        self.score_mask_value = 1e-8
+        self.K = 8
+        self.gmm_version = "1"
+        self.eps = 1e-5
+        self.mlp = nn.Sequential(
+            nn.Linear(attention_rnn_dim, attention_dim, bias=True),
+            nn.Tanh(),
+            nn.Linear(attention_dim, 3*self.K))
+        self.mu_prev = None
+        self.j = None
+        self.count = 0
+        
+    def init_attention(self, processed_memory):
+        b, t, c = processed_memory.size()
+        self.mu_prev = processed_memory.data.new(b, self.K, 1).zero_()
+        j = torch.arange(0, t).to(processed_memory.device)
+        self.j = j.view(1, 1, t)  # [1, 1, T]
+        
+
+    def get_alignment_energies(self, query, processed_memory,
+                               attention_weights_cat):
+        """
+        PARAMS
+        ------
+        query: decoder output (batch, n_mel_channels * n_frames_per_step)
+        processed_memory: processed encoder outputs (B, T_in, attention_dim)
+        attention_weights_cat: cumulative and prev. att weights (B, 2, max_time)
+
+        RETURNS
+        -------
+        alignment (batch, max_time)
+        """
+        
+        self.query = query
+        interm_params = self.mlp(query.unsqueeze(1)).view(query.size(0), -1, self.K)  # [B, 3, K]
+        omega_hat, delta_hat, sigma_hat = interm_params.chunk(3, dim=1)  # Tuple
+        
+        # Each [B, K]
+        # print(delta_hat)
+        omega_hat = omega_hat.squeeze(1)
+        delta_hat = delta_hat.squeeze(1)
+        sigma_hat = sigma_hat.squeeze(1)
+        # Convert intermediate parameters to final mixture parameters
+        # Choose version V0/V1/V2
+        # Formula from https://arxiv.org/abs/1910.10288
+        if self.gmm_version == '0':
+            sigma = (torch.sqrt(torch.exp(-sigma_hat) / 2) + self.eps).unsqueeze(-1)  # [B, K, 1]
+            delta = torch.exp(delta_hat).unsqueeze(-1)  # [B, K, 1]
+            omega = torch.exp(omega_hat).unsqueeze(-1)  # [B, K, 1]
+            Z = 1.0
+        elif self.gmm_version == '1':
+            sigma = (torch.sqrt(torch.exp(sigma_hat)) + self.eps).unsqueeze(-1)
+            delta = torch.exp(delta_hat).unsqueeze(-1)
+            omega = F.softmax(omega_hat, dim=-1).unsqueeze(-1)
+            Z = torch.sqrt(2 * np.pi * sigma**2)
+        elif self.gmm_version == '2':
+            sigma = (F.softplus(sigma_hat) + self.eps).unsqueeze(-1)
+            delta = (F.softplus(delta_hat)).unsqueeze(-1)
+            omega = F.softmax(omega_hat, dim=-1).unsqueeze(-1)
+            Z = torch.sqrt(2 * np.pi * sigma**2)
+        self.delta = delta
+        self.sigma = sigma
+        self.omega = omega
+        self.Z = Z
+        # if self.count>-1:
+        #     assert False, "combination should be either 'concatenation' or 'addition'"
+        # self.count += 1
+        
+        mu = self.mu_prev + delta  # [B, K, 1]
+        # print((delta==0).sum())  # [B, K ,T]alignment)
+        # print(((sigma**2)==0).sum())  # [B, K ,T]alignment)
+        # print(-(self.j-mu)**2)
+        # print((torch.exp(-(self.j-mu)**2)==0).sum())
+        # problem: self.j-mu is too small
+
+        # Get alignment(phi in mathtype)
+        alignment = omega / Z * torch.exp(-(self.j - mu)**2 / (sigma**2) / 2)  # [B, K ,T]
+        alignment = torch.sum(alignment, 1)  # [B, T]
+        # print(alignment)
+
+        # Update mu_prev
+        self.mu_prev = mu
+
+        return alignment
+
+    def forward(self, attention_hidden_state, memory, processed_memory,
+                attention_weights_cat, mask):
+        """
+        PARAMS
+        ------
+        attention_hidden_state: attention rnn last output
+        memory: encoder outputs
+        processed_memory: processed encoder outputs
+        attention_weights_cat: previous and cummulative attention weights
+        mask: binary mask for padded data
+        """
+        alignment = self.get_alignment_energies(
+            attention_hidden_state, processed_memory, attention_weights_cat)
+
+        if mask is not None:
+            alignment.data.masked_fill_(mask, self.score_mask_value)
+
+        # print("start")
+        # print(alignment)
+        attention_context = torch.bmm(alignment.unsqueeze(1), memory)
+        # print(attention_context)
+        attention_context = attention_context.squeeze(1)
+
+        return attention_context, alignment
 
 class LocationLayer(nn.Module):
     def __init__(self, attention_n_filters, attention_kernel_size,
@@ -28,7 +153,7 @@ class LocationLayer(nn.Module):
         processed_attention = processed_attention.transpose(1, 2)
         processed_attention = self.location_dense(processed_attention)
         return processed_attention
-
+    
 
 class Attention(nn.Module):
     def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
@@ -221,6 +346,7 @@ class Decoder(nn.Module):
         self.gate_threshold = hparams.gate_threshold
         self.p_attention_dropout = hparams.p_attention_dropout
         self.p_decoder_dropout = hparams.p_decoder_dropout
+        self.attention_type = hparams.attention_type
 
         self.prenet = Prenet(
             hparams.n_mel_channels * hparams.n_frames_per_step,
@@ -230,10 +356,18 @@ class Decoder(nn.Module):
             hparams.prenet_dim + self.encoder_embedding_dim,
             hparams.attention_rnn_dim)
 
-        self.attention_layer = Attention(
-            hparams.attention_rnn_dim, self.encoder_embedding_dim,
-            hparams.attention_dim, hparams.attention_location_n_filters,
-            hparams.attention_location_kernel_size)
+        if self.attention_type=="LST":
+            self.attention_layer = Attention(
+                hparams.attention_rnn_dim, self.encoder_embedding_dim,
+                hparams.attention_dim, hparams.attention_location_n_filters,
+                hparams.attention_location_kernel_size)
+        elif self.attention_type=="GMM":
+            self.attention_layer = GMMAttention(
+                hparams.attention_rnn_dim, self.encoder_embedding_dim,
+                hparams.attention_dim, hparams.attention_location_n_filters,
+                hparams.attention_location_kernel_size)
+        else:
+            assert False, "attention_type should be either 'LST' or 'GMM'"
 
         self.decoder_rnn = nn.LSTMCell(
             hparams.attention_rnn_dim + self.encoder_embedding_dim,
@@ -286,14 +420,22 @@ class Decoder(nn.Module):
 
         self.attention_weights = Variable(memory.data.new(
             B, MAX_TIME).zero_())
-        self.attention_weights_cum = Variable(memory.data.new(
-            B, MAX_TIME).zero_())
+        if self.attention_type=="LST":
+            self.attention_weights_cum = Variable(memory.data.new(
+                B, MAX_TIME).zero_())
+        else:
+            self.attention_weights = None
+        self.attention_weights_cat = None
         self.attention_context = Variable(memory.data.new(
             B, self.encoder_embedding_dim).zero_())
 
         self.memory = memory
+        # print(memory.shape)
         self.processed_memory = self.attention_layer.memory_layer(memory)
+        # print(self.processed_memory.shape)
         self.mask = mask
+        if self.attention_type=="GMM":
+            self.attention_layer.init_attention(self.processed_memory)
 
     def parse_decoder_inputs(self, decoder_inputs):
         """ Prepares decoder inputs, i.e. mel outputs
@@ -362,14 +504,16 @@ class Decoder(nn.Module):
         self.attention_hidden = F.dropout(
             self.attention_hidden, self.p_attention_dropout, self.training)
 
-        attention_weights_cat = torch.cat(
-            (self.attention_weights.unsqueeze(1),
-             self.attention_weights_cum.unsqueeze(1)), dim=1)
+        if self.attention_type=="LST":
+            self.attention_weights_cat = torch.cat(
+                (self.attention_weights.unsqueeze(1),
+                 self.attention_weights_cum.unsqueeze(1)), dim=1)
         self.attention_context, self.attention_weights = self.attention_layer(
             self.attention_hidden, self.memory, self.processed_memory,
-            attention_weights_cat, self.mask)
+            self.attention_weights_cat, self.mask)
 
-        self.attention_weights_cum += self.attention_weights
+        if self.attention_type=="LST":
+            self.attention_weights_cum += self.attention_weights
         decoder_input = torch.cat(
             (self.attention_hidden, self.attention_context), -1)
         self.decoder_hidden, self.decoder_cell = self.decoder_rnn(
@@ -404,13 +548,14 @@ class Decoder(nn.Module):
         decoder_inputs = self.parse_decoder_inputs(decoder_inputs)
         decoder_inputs = torch.cat((decoder_input, decoder_inputs), dim=0)
         decoder_inputs = self.prenet(decoder_inputs)
-
         self.initialize_decoder_states(
             memory, mask=~get_mask_from_lengths(memory_lengths))
+        # assert False, "combination should be either 'concatenation' or 'addition'"
 
         mel_outputs, gate_outputs, alignments = [], [], []
         while len(mel_outputs) < decoder_inputs.size(0) - 1:
             decoder_input = decoder_inputs[len(mel_outputs)]
+            # decoder_input = self.prenet(decoder_input)
             mel_output, gate_output, attention_weights = self.decode(
                 decoder_input)
             mel_outputs += [mel_output.squeeze(1)]
@@ -475,10 +620,27 @@ class Tacotron2(nn.Module):
         self.embedding.weight.data.uniform_(-val, val)
         self.encoder = Encoder(hparams)
         self.decoder = Decoder(hparams)
+        # if hparams.attention_type=="LST":
+        #     self.decoder = Decoder(hparams)
+        # elif hparams.attention_type=="GMM":
+        #     self.decoder = Decoder_GMM(hparams.n_mel_channels,
+        #                                hparams.n_frames_per_step,
+        #                                hparams.encoder_embedding_dim,
+        #                                [hparams.prenet_dim, hparams.prenet_dim],
+        #                                0.5,
+        #                                hparams.attention_dim,
+        #                                hparams.attention_rnn_dim,
+        #                                hparams.p_attention_dropout,
+        #                                hparams.decoder_rnn_dim,
+        #                                None,
+        #                                hparams.p_decoder_dropout,
+        #                                hparams.max_decoder_steps,
+        #                                hparams.gate_threshold)
         self.postnet = Postnet(hparams)
         self.include_ed = hparams.include_ed
         self.combination = hparams.combination
         self.ed_bool_list = np.array(hparams["phones_words_utterance"]).repeat(4)
+        self.attention_type = hparams.attention_type
         self.concatenation_embedding = hparams.concatenation_embedding
         if hparams.include_ed:
             if hparams.combination=="addition":
@@ -539,6 +701,15 @@ class Tacotron2(nn.Module):
 
         mel_outputs, gate_outputs, alignments = self.decoder(
             encoder_outputs, mels, memory_lengths=text_lengths)
+        # if self.attention_type=="LST":
+        #     mel_outputs, gate_outputs, alignments = self.decoder(
+        #         encoder_outputs, mels, memory_lengths=text_lengths)
+        # elif self.attention_type=="GMM":
+        #     mel_outputs, gate_outputs, alignments = self.decoder(
+        #         encoder_outputs, mels.transpose(1, 2), memory_lengths=text_lengths)
+        #     mel_outputs = mel_outputs.transpose(1, 2)
+        # else:
+        #     assert False, "attention_type should be either 'LST' or 'GMM'"
 
         mel_outputs_postnet = self.postnet(mel_outputs)
         mel_outputs_postnet = mel_outputs + mel_outputs_postnet
@@ -563,8 +734,15 @@ class Tacotron2(nn.Module):
                 encoder_outputs = encoder_outputs + self.ed_embedding(ed.transpose(1, 2))
             else:
                 assert False, "combination should be either 'concatenation' or 'addition'"
-        mel_outputs, gate_outputs, alignments = self.decoder.inference(
-            encoder_outputs)
+        mel_outputs, gate_outputs, alignments = self.decoder.inference(encoder_outputs)
+        # if self.attention_type=="LST":
+        #     mel_outputs, gate_outputs, alignments = self.decoder.inference(encoder_outputs)
+        # elif self.attention_type=="GMM":
+        #     mel_outputs, gate_outputs, alignments = self.decoder(
+        #         encoder_outputs, None, memory_lengths=None)
+        #     mel_outputs = mel_outputs.transpose(1, 2)
+        # else:
+        #     assert False, "attention_type should be either 'LST' or 'GMM'"
 
         mel_outputs_postnet = self.postnet(mel_outputs)
         mel_outputs_postnet = mel_outputs + mel_outputs_postnet

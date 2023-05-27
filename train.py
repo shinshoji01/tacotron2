@@ -17,7 +17,7 @@ from loss_function import Tacotron2Loss
 
 import sys
 sys.path.append("/work/Git/")
-from tacotron2.model_copy import Tacotron2
+from tacotron2.model import Tacotron2
 
 
 def reduce_tensor(tensor, n_gpus):
@@ -54,7 +54,7 @@ def prepare_dataloaders(hparams):
     else:
         train_sampler = None
         shuffle = True
-
+    shuffle=False
     train_loader = DataLoader(trainset, num_workers=1, shuffle=shuffle,
                               sampler=train_sampler,
                               batch_size=hparams.batch_size, pin_memory=False,

@@ -13,11 +13,23 @@
 
 "load_mel_from_disk": "True",
 "Dataset_dir": "./../../../Dataset/Blizzard2013/",
+"Feature_dir": "./Blizzard_MFA/Audiofeatures/",
 "base_dir": "./../../tacotron2/",
 "training_files": "filelists/bli_audio_text_train_filelist.txt",
 "validation_files": "filelists/bli_audio_text_test_filelist.txt",
 "text_cleaners": ["english_cleaners"],
+
 "include_ed": "True",
+"normalize_mel": "True",
+"mel_mean_std": "./37_mean_std_Blizzard.npy",
+"blizzard_normalization": "True",
+"combination": "addition",
+"attention_type": "LST",
+"concatenation_embedding": "False",
+
+"include_EDP": "False",
+"position_input": "True",
+"edp_lambda": 0.01,
 
 "max_wav_value": 32768.0,
 "sampling_rate": 22050,

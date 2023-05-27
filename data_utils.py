@@ -2,6 +2,7 @@ import random
 import numpy as np
 import torch
 import torch.utils.data
+import os
 
 import layers
 from text import text_to_sequence
@@ -30,6 +31,7 @@ class TextMelLoader(torch.utils.data.Dataset):
         random.seed(hparams.seed)
         random.shuffle(self.audiopaths_and_text)
         self.Dataset_dir = hparams.Dataset_dir
+        self.Feature_dir = hparams.Feature_dir
         self.mel_mean_std = np.load(hparams.mel_mean_std)
         self.normalize_mel = hparams.normalize_mel
         self.blizzard_normalization = hparams.blizzard_normalization
@@ -41,7 +43,8 @@ class TextMelLoader(torch.utils.data.Dataset):
         mel = self.get_mel(audiopath)
         ed = self.get_ed(audiopath)
         sp = self.get_sp(audiopath)
-        return (text, mel, ed, sp)
+        word_dir = self.get_worddir(audiopath)
+        return (text, mel, ed, sp, word_dir)
 
     def get_mel(self, filename):
         filename = self.Dataset_dir + filename
@@ -83,6 +86,9 @@ class TextMelLoader(torch.utils.data.Dataset):
         filename = self.Dataset_dir + filename
         ed = torch.from_numpy(np.load(filename))
         return ed
+    
+    def get_worddir(self, filename):
+        return np.load(self.Feature_dir + filename.split("/")[-2] + "/" + ".".join(os.path.basename(filename).split(".")[:-1]) + "_words_phones_dir.npy", allow_pickle=True).item()
 
     def __getitem__(self, index):
         return self.get_mel_text_pair(self.audiopaths_and_text[index])
